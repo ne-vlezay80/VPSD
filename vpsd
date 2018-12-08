@@ -1,0 +1,1437 @@
+#!/bin/bash
+
+MODLIST=/tmp/module
+
+	if [ -f "$MODLIST" ]
+	then
+
+		M=$(for a in $(cat $MODLIST|tr ' ' '~')
+		do
+			MODPATH=$(echo $a|tr '~' ' '|awk '{print $2}')
+       			 MODNAME=$(echo $a|tr '~' ' '|awk '{print $1}')
+
+			if [ "$MODPATH" != "" ]
+			then
+				 echo "${MODNAME},${MODPATH}"
+		       	 else
+		                  true
+		        fi
+		done)
+	else
+		true
+	fi
+
+for a in $M
+do
+	mpath=$(echo $a|tr ',' ' '|awk '{print $2}')
+	. $mpath
+done
+
+for a in $M
+do
+	mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+	${mname}_init
+done
+
+PARAM=$(echo $*)
+PARAM_COUNT=$(echo ${PARAM}|wc -w)
+CONFIG_DIR="/home/vpsop/vm"
+USR=vpsop
+
+HOST_RAM=$(free -m|grep "Mem:"|awk '{print $2}')
+HOST_SWP=$(free -m|grep "Mem:"|awk '{print $2}')
+
+ACTION=$(echo $PARAM|awk '{print $1}')
+VM=$(echo $PARAM|awk '{print $2}')
+
+MEM=$(echo $PARAM|awk '{print $3}')
+DISK=$(echo $PARAM|awk '{print $4}')
+MAC=$(echo $PARAM|awk '{print $5}')
+VNC_PORT=$(echo $PARAM|awk '{print $6}')
+SWITCH=$(echo $PARAM|awk '{print $7}')
+
+UUID=$(/scripts/uuidgen)
+NETLIB_INIT="/scripts/vmnet"
+
+
+HOST_TOTAL_MEM=$(echo ${HOST_RAM}+${HOST_SWP}|bc)
+
+vm_test ()
+{
+	if [ "$VM" == "" ]
+	then
+		VM_PID=""
+	else
+		VM_PID=$(ps ax 2>/dev/null|grep -w qemu|grep -w $VM|grep -v grep|awk '{print $1}')
+		VM_UUID=$(ps ax 2>/dev/null|grep -w qemu|grep -w $VM|awk '{print $8}')
+	fi
+}
+
+MON_PATH=/var/run
+
+
+LIST_COLUMN="VM:        STATUS:        Disk size:	PID:        UUID:	MACs:\n"
+LIST_COLUMN_IMG="Image:        Type:        Size:\n"
+START_VM_OK="Starting VM is OK\n"
+START_VM_FAILED="Starting VM is FAILED\n"
+STOP_VM_OK="Stop VM is OK\n"
+STOP_VM_FAILED="Stop VM is FAILED\n"
+VM_IS_RUN="VM is RUNNING\n"
+VM_CONFIG_NOT_FOUND="ERROR: Config not found\n"
+VM_CONFIG_NOT_FOUND_SWITCH="ERROR: Switch сonfig not found\n"
+NAME_NO_SET="ERROR: name is not set.\n"
+SEND_REQUEST_OK="Send request is OK\n"
+SEND_REQUEST_FAILED="Send request is FAILED\n"
+ENTER_VM_NAME="ERROR: enter VM name\n"
+
+TEST_HYP_MSG="Testing the hypervisor...\n"
+TEST_HYP_MSG_TUN="TUN/TAP..."
+TEST_HYP_MSG_KVM="KVM..."
+TEST_HYP_MSG_VHOST_NET="Vhost-net..."
+TEST_HYP_MSG_VHOST_SOCK="Vhost-socket..."
+TEST_IS_OK="OK\n"
+TEST_IS_FAILED="FAILED\n"
+TEST_IS_SCORE="The hypervisor score:"
+
+CREATE_VM_MSG="Creating..."
+CREATE_VM_OK="[OK]\n"
+CREATE_VM_FAILED="[FAILED]\n"
+VM_EXIST="ERROR: VM is exist."
+
+ERROR_NOT_SET_MEM="ERROR: memory is not set.\n"
+ERROR_NOT_SET_VNC="ERROR: vnc port is not set.\n"
+ERROR_NOT_SET_DSK="ERROR: disk is not set.\n"
+ERROR_NOT_SET_MAC="ERROR: mac address is not set.\n"
+ERROR_NOT_SET_SWITCH="ERROR: switch is not set.\n"
+ERROR_NOT_SWITCH_FOUND="ERROR: switch is not found.\n"
+ERROR_NOT_MEMORY_AVAIBLE="ERROR: Not memory avaible.\n"
+
+
+
+
+# Config example
+
+config_example () {
+-name test \
+-drive file=test.qcow2,if=virtio \
+-netdev tap,ifname=test,id=net0 \
+-device virtio-net-pci,netdev=net0,id=vionet.0 \
+-vnc 127.0.0.1:1 \
+-enable-kvm \
+-m 128M
+
+}
+
+
+if [ -f $(echo $NETLIB_INIT|awk '{print $1}') ]
+then
+
+	VMNET_SC=true
+	. $NETLIB_INIT
+	NETLIB_ST=true
+else
+	true
+fi
+
+dump () {
+	cd ${CONFIG_DIR}
+	vm_test
+	if [ -f ${VM}.conf ]
+	then
+		nano ${VM}.conf
+	else
+                printf "$VM_CONFIG_NOT_FOUND"
+                return 1
+	fi		
+}
+
+block_test () {
+        cd ${CONFIG_DIR}
+	if [ -f ${VM}.block ]
+	then
+                BLOCK_REASON=$(cat ${VM}.block)
+                return 1
+	else
+		return 0
+	fi
+}
+
+root_test () {
+	if [ "$(id -u)" == "0" ]
+	then
+		return 0
+	else
+		echo "ERROR: Please exec the command to root."
+		return 1
+	fi
+}
+
+block_add () {
+	root_test
+        cd ${CONFIG_DIR}
+	if [ "$PARAM_COUNT" -ge "2" ]
+        then
+                true
+        else
+                printf "$VM_EXIST"
+                return 1
+        fi
+
+        if [ -f ${VM}.conf ]
+        then
+		true
+	else
+                printf "$NAME_NO_SET"
+                return 1
+        fi
+	if confirm
+	then
+		echo -ne "$MEM" >${VM}.block
+		echo "OK"
+		return 0
+	else
+		echo "FAIL"
+		return 1
+	fi
+
+}
+
+block_delete () {
+	root_test
+        cd ${CONFIG_DIR}
+        if [ "$PARAM_COUNT" -ge "2" ]
+        then
+                true
+        else
+                printf "$VM_EXIST"
+                return 1
+        fi
+
+        if [ -f ${VM}.conf ]
+        then
+		true
+        else
+                printf "$NAME_NO_SET"
+                return 1
+        fi
+
+        if [ -f ${VM}.block ]
+        then
+                true
+        else
+                printf "VM is not blocked.\n"
+                return 1
+        fi
+
+	if confirm
+	then
+		rm ${VM}.block
+		echo "OK"
+	else
+		echo "FAILED"
+		return 1
+	fi
+}
+
+get_disk_size () {
+	cd ${CONFIG_DIR}
+
+        if [ -f ${VM}.conf ]
+        then
+                true
+        else
+                printf "$NAME_NO_SET"
+                return 1
+        fi
+
+	SZ=$(qemu-img info -U -f qcow2 ${VM}.qcow2|grep "virtual size"|awk '{print $3}')
+        SZ_R=$(qemu-img info -U -f qcow2 ${VM}.qcow2|grep "disk size"|awk '{print $3}')
+
+}
+
+confirm () {
+      	local CCODE=$(cat /dev/urandom|tr -dc '0-9'|head -c 8)
+        echo "Please confirn operatiom."
+        echo "Please enter [ $CCODE ] to confirm."
+
+        read CONF
+
+	if [ "$CONF" == "$CCODE" ]
+	then
+		return 0
+	else
+		return 1
+	fi
+}
+
+if [ "$CF_AGENT" != "" ] || [ -f "$CF_AGENT" ]
+then
+	unset confirm
+	. "$CF_AGENT"
+else
+	true
+fi
+
+
+
+create() {
+	root_test
+	cd ${CONFIG_DIR}
+
+	if [ "$PARAM_COUNT" -ge "7" ]
+	then
+		true
+	else
+		printf "$VM_EXIST"
+		return 1
+	fi
+
+	if [ -f ${VM}.conf ]
+	then
+		printf "$VM_EXIST"
+		return 1
+	else
+		true
+	fi
+
+	local CMEM=$(echo $MEM|grep -o "[0-9]*")
+
+	if [ "$CMEM" == "" ] ||  [ "$CMEM" == "$(echo $CMEM|sed -e 's/[0-9]//g')" ]
+	then
+		printf "$ERROR_NOT_SET_MEM"
+		return 1
+	else
+		true
+	fi
+
+        if [ "$VNC_PORT" == "" ] || [ "$VNC_PORT" == "$(echo $VNC_PORT|sed -e 's/[0-9]//g')" ] || [ "$VNC_PORT" -ge "1000" ]
+        then
+                printf "$ERROR_NOT_SET_VNC"
+                return 1
+        else
+                true
+        fi
+
+	if [ "$DISK" == "" ] || [ "$DISK" == "$(echo $DISK|sed -e 's/[0-9]//g')" ] 
+	then
+		printf "$ERROR_NOT_SET_DSK"
+		return 1
+	else
+		true
+	fi
+	
+	if [ "$CMEM" -ge "$HOST_TOTAL_MEM" ]
+	then
+		printf "$ERROR_NOT_MEMORY_AVAIBLE"
+		return 1
+	else
+		true
+	fi
+
+
+        if [ "$MAC" == "" ]
+        then
+                printf "$ERROR_NOT_SET_MAC"
+                return 1
+        else
+                true
+        fi
+
+	if mac_test $MAC
+	then
+		true
+	else
+                printf "$ERROR_NOT_SET_MAC"
+		return 1
+	fi
+
+        if [ "$SWITCH" == "" ]
+        then
+                printf "$ERROR_NOT_SET_SWITCH"
+                return 1
+        else
+                true
+        fi
+
+	ip link show dev $SWITCH >/dev/null 2>&1
+	if [ "$?" == "0" ]
+	then
+		true
+	else
+		printf "$ERROR_NOT_SWITCH_FOUND"
+		return 1
+	fi
+
+
+	if create_confirm
+	then
+		true
+	else
+		return 1
+	fi
+	echo "-name ${VM}" '\' >>${VM}.conf
+        echo "-drive file=${VM}.qcow2,if=virtio" '\' >>${VM}.conf
+        echo "-netdev tap,ifname=${VM},id=net0" '\' >>${VM}.conf
+        echo "-device virtio-net-pci,netdev=net0,id=vionet.0,mac=${MAC}" '\' >>${VM}.conf
+        echo "-vnc 127.0.0.1:${VNC_PORT}" '\' >>${VM}.conf
+        echo "-enable-kvm" '\' >>${VM}.conf
+        echo "-m ${CMEM}M" >>${VM}.conf
+
+	qemu-img create -f qcow2 ${VM}.qcow2 ${DISK}M
+
+	echo "$VM $SWITCH" >>${VM}.switch
+
+	chown ${USR}:${USR} ${VM}.conf
+        chown ${USR}:${USR} ${VM}.qcow2
+        chown ${USR}:${USR} ${VM}.switch
+
+
+}
+
+
+
+remove () {
+	root_test
+        cd ${CONFIG_DIR}
+	vm_test
+	if [ "$VM_PID" == "" ]
+	then
+		true
+	else
+		printf "$VM_IS_RUN"
+		return 1
+	fi
+
+        if [ -f ${VM}.conf ]
+        then
+              	true
+        else
+                printf "$VM_EXIST"
+                return 1
+        fi
+
+	if confirm
+	then
+		echo "Removing..."
+		rm "${VM}.conf"
+                rm "${VM}.qcow2"
+                rm "${VM}.switch"
+	        if [ -f ${VM}.block ]
+	        then
+	                rm ${VM}.block
+	        else
+	           	true
+	        fi
+
+	else
+		echo "Confirm code failed. returning..."
+		return 1
+	fi
+
+}
+
+at_manager () {
+        cd $CONFIG_DIR
+        cd ..
+	local img_path=$(readlink -f $MEM 2>/dev/null)
+	local img_type=$(ls $MEM 2>/dev/null|tr '.' ' '|awk '{print $2}')
+	root_test
+	local ACTION=$VM
+	if [ "$VM" != "" ]
+	then
+		true
+	else
+		echo "ERROR: command is incompleted."
+		return 1
+	fi
+
+	if [ "$VM" == "help" ]
+	then
+		echo "cdrom [img] [vm] - attach cdrom."
+                echo "floppy [img] [vm] - attach floppy."
+		return 0
+	else
+		true
+	fi
+
+	if [ "$MEM" != "" ]
+	then
+	       	true
+	else
+  	        echo "ERROR: command is incompleted."
+	        return 1
+	fi
+
+	case $OOO in
+	attach)
+        if [ "$DISK" != "" ]
+        then
+                true
+        else
+                echo "ERROR: command is incompleted."
+                return 1
+        fi
+	;;
+	detach)
+		DISK=null
+	;;
+	esac
+
+	case $ACTION in
+	cdrom)
+		case $OOO in
+		attach)
+			case $img_type in
+	                iso)
+	                        true
+	                        ;;
+	                * )
+	                        echo "ERROR: cdrom format not supported."
+	                        return 1
+	                        ;;
+	                esac
+        		printf "change ide1-cd0 ${img_path}\n"|socat - UNIX-CONNECT:${MON_PATH}/${DISK}.ctl >/dev/null 2>/dev/null
+			;;
+		detach)
+                        printf "eject ide1-cd0\n"|socat - UNIX-CONNECT:${MON_PATH}/${MEM}.ctl >/dev/null 2>/dev/null
+			;;
+		esac
+		if [ "$?" == "0" ]
+		then
+			echo "OK"
+			return 0
+		else
+			echo "FAILED"
+			return 1
+		fi
+		;;
+        floppy)
+                case $OOO in
+                attach)
+			case $img_type in
+	                img|vfd)
+	                        true
+	                        ;;
+	                * )
+	                        echo "ERROR: floppy format not supported."
+	                        return 1
+	                        ;;
+	                esac
+                	printf "change floppy0 ${img_path}\n"|socat - UNIX-CONNECT:${MON_PATH}/${DISK}.ctl >/dev/null 2>/dev/null
+			;;
+                detach)
+                        printf "eject floppy0\n"|socat - UNIX-CONNECT:${MON_PATH}/${MEM}.ctl >/dev/null 2>/dev/null
+                        ;;
+                esac
+
+                if [ "$?" == "0" ]
+                then
+                        echo "OK"
+                        return 0
+                else
+                        echo "FAILED"
+                        return 1
+                fi
+		;;
+	* )
+		return 1
+		;;
+esac
+}
+
+list_img () {
+        cd $CONFIG_DIR
+	cd ..
+        local COLLUMN="$(printf "$LIST_COLUMN"|wc -c)"
+        local CONT=0
+        printf "$LIST_COLUMN_IMG"
+
+        for a in $(seq $CONT $COLLUMN)
+        do
+                echo -ne "="
+                CONT=$(echo ${CONT}+1|bc)
+        done
+        echo -ne "\n"
+
+        for a in $(ls)
+        do
+		local img_file=$(
+				echo $a|grep -w "img"
+                		echo $a|grep -w "qcow2"
+				echo $a|grep -w "qcow"
+                                echo $a|grep -w "iso"
+                                echo $a|grep -w "vfd"
+				)
+		local img_type=$(echo $img_file|sed 's/\(.*\)\./\1 /'|awk '{print $2}')
+		local img_size=$(
+				case $img_type in
+				qcow2)
+					qemu-img info -U -f qcow2 ${img_file}|grep "disk size"|awk '{print $3}'
+					;;
+				qcow)
+                                        qemu-img info -U -f qcow ${img_file}|grep "disk size"|awk '{print $3}'
+                                        ;;
+				*)
+					du -k ${img_file}|awk '{print $1}'
+					;;
+				esac
+				)
+		local img_name=$(echo $img_file|tr '.' ' '|awk '{print $1}')
+		if [ "$img_file" != "" ]
+		then
+			local ENT=true
+		else
+			local ENT=false
+		fi
+
+		case $ENT in
+		true)
+                	        echo "$img_name 	$img_type       	$img_size"
+			;;
+		false)
+			true
+			;;
+		esac
+	done
+	return 0
+}
+
+get_serial () {
+	        cd $CONFIG_DIR
+	        cd ..
+		local KEY=$(ls|grep "$MEM"|grep -w "key")
+		if [ "$MEM" != "" ]
+		then
+			if [ "$KEY" != "" ]
+			then
+				cat $KEY
+				return 0
+			else
+				echo "ERROR: Serial not found."
+				return 1
+			fi
+		else
+			echo "ERROR: Please enter image name."
+			return 1
+		fi
+}
+
+get_mac_address () {
+	cd $CONFIG_DIR
+
+	if [ -f "${VM}.conf" ]
+	then
+		true
+	else
+		return 0
+	fi
+
+	MAC_ADDRESSES=$(
+		for a in $(cat ${VM}.conf|grep 'netdev='|grep 'device'|tr -d '\' ' '|tr ',' '\n'|grep mac)
+		do
+			echo $a|tr '=' ' '|awk '{print $2}'
+		done
+	)
+}
+
+mac_test () {
+	if  [ `echo "$1"|egrep "^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$"` ]
+	then
+        	return 0
+	else
+        	return 1
+	fi
+
+}
+
+create_confirm () {
+	echo "Please confirm."
+	echo "========================"
+	echo "VM name: $VM"
+	echo "Memory: ${CMEM}Mb"
+	echo "Disk size: ${DISK}Mb"
+	echo "MAC: $MAC"
+	echo "VNC Port: ${VNC_PORT}"
+	echo
+	echo "Create? [Y|N]"
+	read -n 1 cc
+	case $cc in
+	Y|y)
+		return 0
+		;;
+	N|n)
+		return 1
+		;;
+	* )
+		return 1
+		;;
+	esac
+}
+
+get_ports_name () {
+        cd $CONFIG_DIR
+
+        if [ -f "${VM}.conf" ]
+        then
+                true
+        else
+                return 0
+        fi
+
+        PORTS=$(
+                for a in $(cat ${VM}.conf|grep 'netdev'|grep 'id=net'|tr -d '\' ' '|tr ',' '\n'|grep ifname)
+                do
+                        local p=$(echo $a|tr '=' ' '|awk '{print $2}')
+			local b=$(ip link show dev $(echo $a|tr '=' ' '|awk '{print $2}') 2>/dev/null|awk '{print $9}')
+			printf "$p"
+			printf ":"
+			if [ "$b" != "" ]
+			then
+				printf "$b"
+			else
+				printf '(none)'
+			fi
+                done
+        )
+}
+
+
+list () {
+
+	local PARAM=$VM
+
+                for a in $M
+                do
+                        mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+                        if type ${mname}_pre_list 2>/dev/null >/dev/null
+                        then
+                                ${mname}_pre_list
+                        else
+                                true
+                        fi
+                done
+
+
+	case $PARAM in
+	images)
+		if list_img
+		then
+			return 0
+		else
+			return 1
+		fi
+		;;
+        serial)
+                if get_serial
+                then
+                        return 0
+                else
+                        return 1
+                fi
+                ;;
+	help)
+		echo "images - list avaible images from hypervisor."
+                echo "serial [img] - get serial from pirate system."
+		return 0
+		;;
+	* )
+		true
+		;;
+	esac
+
+	local COLLUMN="$(printf "$LIST_COLUMN"|wc -c)"
+	local CONT=0
+	printf "$LIST_COLUMN"
+
+	for a in $(seq $CONT $COLLUMN)
+	do
+		echo -ne "="
+		CONT=$(echo ${CONT}+1|bc)
+	done
+	echo -ne "\n"
+	cd $CONFIG_DIR
+	for a in $(ls $CONFIG_DIR)
+	do
+		if [ "$a" ==  "$(echo $a|grep conf)" ]
+		then
+			name=$(cat $a|grep -w "name"|awk '{print $2}')
+			VM=$name
+			vm_test
+			status=$(
+			if [ "$VM_PID" == "" ]
+			then
+                                if block_test
+                                then
+                                        local VM_STATE=1
+                                else
+                                        local VM_STATE=3
+                                fi
+			else
+                                	local VM_STATE=2
+			fi
+
+			case $VM_STATE in
+			1)
+                                echo "STOPPED"
+				;;
+			2)
+                                echo "RUNNING"
+				;;
+			3)
+				echo "BLOCKED (REASON: $BLOCK_REASON)"
+				;;
+			esac
+			)
+			get_disk_size
+			disk_size=$(
+					if [ "$SZ" != "" ]
+					then
+						echo $SZ
+					else
+						echo "0B"
+					fi
+				
+			)
+			get_mac_address
+
+			if [ "$MAC_ADDRESSES" != "" ]
+			then
+				MACS="$(echo $MAC_ADDRESSES|tr ' ' ',')"
+			else
+				MACS='(null)'
+			fi
+
+			if [ "$VM_PID" != "" ]
+			then
+				PP=$VM_PID
+			else
+				PP='(null)'
+			fi
+			
+			if [ "$VM_UUID" != "" ]
+			then
+				UD=$VM_UUID
+			else
+				UD='00000000-0000-0000-0000-000000000000'
+			fi
+			get_ports_name
+                        if [ "$PORTS" != "" ]
+                        then
+                                PR=$(echo $PORTS|tr ' ' ',')
+                        else
+                                PR='(null)'
+                        fi
+
+
+                for a in $M
+                do
+                        mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+                        if type ${mname}_list 2>/dev/null >/dev/null
+                        then
+                                ${mname}_list
+                        else
+                                true
+                        fi
+                done
+
+			echo "$name	$status		$disk_size ($SZ_R)	$PP			$UD	$MACS	$PR"		
+		else
+			true
+		fi
+	done		
+}
+
+start () {
+                for a in $M
+                do
+                        mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+                        if type ${mname}_pre_start 2>/dev/null >/dev/null
+                        then
+                                ${mname}_pre_start
+                        else
+                                true
+                        fi
+                done
+		root_test
+		cd $CONFIG_DIR
+		VM_CFG=$(cat ${VM}.conf 2>/dev/null)
+		sw=$(cat ${VM}.switch 2>/dev/null|xxd -ps -c 1)
+
+		if [ -f ${VM}.conf ]
+		then
+			true
+		else
+			echo "$VM_CONFIG_NOT_FOUND"
+			return 1
+		fi
+
+                if [ -f ${VM}.switch ]
+                then
+                        true
+                else
+                        printf "$VM_CONFIG_NOT_FOUND_SWITCH"
+                        return 1
+                fi
+
+
+
+		vm_test
+		if [ "$VM_PID" == "" ]
+		then
+			true
+		else
+			printf "$VM_IS_RUN"
+			return 1
+		fi
+		count=0
+
+		if block_test
+		then
+			true
+		else
+			echo "VM is blocked from administrator."
+			echo "Reason: $BLOCK_REASON"
+			return 1
+		fi
+		for a in $(echo $VM_CFG|tr ' ' '~'|tr '\' ' ')
+		do
+			NAME=$(echo $a|tr '~' ' '|grep -w "name"|awk '{print $2}')
+			if [ "$NAME" == "" ]
+			then
+				printf "$NAME_NO_SET"
+				return 1
+			else
+				break
+			fi
+		done
+
+                for a in $M
+                do
+                        mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+                        if type ${mname}_start 2>/dev/null >/dev/null
+                        then
+                                ${mname}_start
+                        else
+                                true
+                        fi
+                done
+
+
+		export switch=$sw
+                if  qemu-system-x86_64 -monitor unix:${MON_PATH}/${VM}.ctl,server,nowait  \
+		-uuid $UUID -daemonize -runas $USR \
+		$(echo $VM_CFG|tr '\' ' '|sed "s/MAC_RND/$MAC_RANDOM/")
+		then
+			printf "$START_VM_OK"
+			return 0
+		else
+			printf "$START_VM_FAILED"
+			return 1
+		fi
+
+}
+
+stop () {
+		root_test
+		vm_test
+                if [ "$VM_PID" != "" ]
+                then
+                        true
+                else
+                        echo "ERROR: vm not is running."
+                        return 1
+                fi
+
+		if kill $VM_PID 2>/dev/null
+		then
+			printf "$STOP_VM_OK"
+			return 0
+		else
+                        printf "$STOP_VM_FAILED"
+			return 1
+		fi
+}
+
+pause () {
+	root_test
+	printf "stop\n"|socat - UNIX-CONNECT:${MON_PATH}/${VM}.ctl >/dev/null 2>/dev/null
+	if [ "$?" == "0" ]
+	then
+		printf "$SEND_REQUEST_OK"
+		return 0
+	else
+		printf "$SEND_REQUEST_FAILED"
+		return 1
+	fi
+}
+
+reset () {
+        root_test
+        printf "system_reset\n"|socat - UNIX-CONNECT:${MON_PATH}/${VM}.ctl >/dev/null 2>/dev/null
+        if [ "$?" == "0" ]
+        then
+                printf "$SEND_REQUEST_OK"
+                return 0
+        else
+                printf "$SEND_REQUEST_FAILED"
+                return 1
+        fi
+}
+
+
+cont () {
+	root_test
+        printf "cont\n"|socat - UNIX-CONNECT:${MON_PATH}/${VM}.ctl >/dev/null 2>/dev/null
+        if [ "$?" == "0" ]
+        then
+                printf "$SEND_REQUEST_OK"
+                return 0
+        else
+                printf "$SEND_REQUEST_FAILED"
+                return 1
+        fi
+}
+
+test () {
+	local SCORE_C=4
+	local SCORE=0
+	printf "$TEST_HYP_MSG"
+	printf "$TEST_HYP_MSG_TUN"
+	if [ -c /dev/net/tun ]
+	then
+		printf "$TEST_IS_OK"
+                SCORE=$(echo ${SCORE}+1|bc)
+
+	else
+		printf "$TEST_IS_FAILED"
+	fi
+
+        printf "$TEST_HYP_MSG_KVM"
+        if [ -c /dev/kvm ]
+        then
+                printf "$TEST_IS_OK"
+                SCORE=$(echo ${SCORE}+1|bc)
+        else
+                printf "$TEST_IS_FAILED"
+        fi
+        printf "$TEST_HYP_MSG_VHOST_NET"
+        if [ -c /dev/vhost-net ]
+        then
+                printf "$TEST_IS_OK"
+                SCORE=$(echo ${SCORE}+1|bc)
+        else
+                printf "$TEST_IS_FAILED"
+        fi
+
+        printf "$TEST_HYP_MSG_VHOST_SOCK"
+        if [ -c /dev/vhost-vsock ]
+        then
+                printf "$TEST_IS_OK"
+                SCORE=$(echo ${SCORE}+1|bc)
+        else
+                printf "$TEST_IS_FAILED"
+        fi
+	printf "$TEST_IS_SCORE ${SCORE}/${SCORE_C}\n"
+	
+}
+
+help () {
+		echo "The script command:"
+		echo "start [vm] - start the virtual machine."
+		echo "stop [vm] - stop the virtual machine."
+		echo "create [vm] [ramsize] [disksize] [mac address] [vncport] [switch] - create new virtual machine"
+		echo "remove [vm] - remove the virtual machine"
+		echo "pause [vm] - suspend the virtual machine."
+		echo "cont [vm] - continue the virtual machine."
+		echo "dump [vm] - open vm config file."
+		echo "help - the help."
+                echo "attach - attach image from vm."
+                echo "detach - detach image from vm."
+		echo "list - list all virtual machines."
+                echo "block [vm] [reason]  - block the VPS"
+                echo "unblock [vm]  - block the VPS"
+		echo "cli - open cli shell."
+
+		case $NETLIB_ST in
+		true)
+			echo "shaper_add [vm_iface] [up] [down] [netem act] [netem param] - activate thish shaper."
+                        echo "shaper_del [vm_iface] - remove thish shaper."
+			;;
+		* )
+			true
+			;;
+		esac
+		for a in $M
+		do
+        		mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+			if type ${mname}_help 2>/dev/null >/dev/null
+        		then
+                		${mname}_help
+        		else
+                		true
+        		fi
+		done
+
+
+		return 0
+}
+
+cli_trap () {
+	return 0
+}
+
+netlib_cmd_shaper_add () {
+	case $NETLIB_ST in
+	true)
+		IF=$VM
+		speedUp=$MEM
+                speedDown=$DISK
+		NETEM_ACT=$MAC
+		NETEM_PARAM=$VNC_PORT
+
+		if [ "$IF" != "" ] || [ "$speedUp" != "" ] || [ "$speedDown" != "" ]
+		then
+			true
+		else
+			echo "Param error."
+			return 1
+		fi
+
+		shaper
+		;;
+	* )
+		echo "Command disabled."
+		return 1
+		;;
+	esac
+}
+
+netlib_cmd_shaper_remove () {
+        case $NETLIB_ST in
+        true)
+                IF=$VM
+                if [ "$IF" != "" ]                                                  
+                then
+                        true
+                else
+                        echo "Param error."
+                        return 1
+                fi
+
+                shaper_remove
+                ;;
+        * )
+                echo "Command disabled.."
+                return 1
+                ;;
+	esac
+	
+}
+
+
+cli_shell () {
+	trap cli_trap SIGINT
+	while true
+	do
+		read -p 'VPSD: ' SHL
+		CMD=$(echo $SHL|awk '{print $1}' )
+                VM=$(echo $SHL|awk '{print $2}')
+                MEM=$(echo $SHL|awk '{print $3}')
+                DISK=$(echo $SHL|awk '{print $4}')
+                MAC=$(echo $SHL|awk '{print $5}')
+                VNC_PORT=$(echo $SHL|awk '{print $6}')
+                SWITCH=$(echo $SHL|awk '{print $7}')
+
+
+	if [ "$CMD" != "" ]
+	then
+		true
+	else
+		cli_shell
+	fi
+
+	for a in $M
+	do
+        	mname=$(echo $a|tr ',' ' '|awk '{print $1}')
+		if type ${mname}_cmd 2>/dev/null >/dev/null
+		then
+			${mname}_cmd
+		else
+			true
+		fi
+	done
+
+	case $CMD in
+	quit|exit)
+		echo "Goodbaye..."
+		exit 0
+		;;
+	list)
+		list
+		;;
+	start)
+		if [ "$VM" != "" ]
+		then
+			true
+		else
+			printf "$ENTER_VM_NAME"
+			cli_shell
+		fi
+		start
+		;;
+        create)
+                PARAM_COUNT=$(echo $SHL|wc -w)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                else
+                        true
+                fi
+
+                create
+                ;;
+
+        remove)
+                if [ "$VM" != "" ]
+                then
+                        true
+                else
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                fi
+                remove
+                ;;
+
+
+        stop)
+                if [ "$VM" != "" ]
+                then
+                        true
+                else
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                fi
+                stop
+                ;;
+	attach)
+		OOO=attach
+		at_manager
+		;;
+        detach)
+		OOO=detach
+                at_manager
+                ;;
+        pause)
+                if [ "$VM" != "" ]
+                then
+                        true
+                else
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                fi
+                pause
+                ;;
+        cont)
+                if [ "$VM" != "" ]
+                then
+                        true
+                else
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                fi
+                cont
+                ;;
+
+        block)
+		PARAM_COUNT=$(echo $SHL|wc -w)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                else
+                        true
+                fi
+
+                block_add
+                ;;
+        unblock)
+                PARAM_COUNT=$(echo $SHL|wc -w)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                else
+                        true
+                fi
+
+                block_delete
+                ;;
+        dump)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        cli_shell
+                else
+                        true
+                fi
+                dump
+                ;;
+
+	modload)
+		mod_load
+		;;
+	help)
+		help
+		;;
+	shaper_add)
+		netlib_cmd_shaper_add
+		;;
+        shaper_del)
+                netlib_cmd_shaper_remove
+                ;;
+	cli)
+		echo "ERROR: cli mode is enabled."
+		;;
+	reset)
+		reset
+		;;
+	* )
+		echo "Command $CMD not found."
+		;;
+	esac
+
+	done
+}
+
+main () {
+case $ACTION in
+	cli)
+		cli_shell
+		;;
+	start)
+		if [ "$VM" == "" ]
+		then
+			printf "$ENTER_VM_NAME"
+			return 1
+		else
+			true
+		fi
+		start
+		;;
+	stop)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+                else
+                        true
+                fi
+
+		stop
+		;;
+        pause)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+                else
+                        true
+                fi
+
+                pause
+                ;;
+        cont)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+                else
+                        true
+                fi
+
+                cont
+                ;;
+	create)
+               if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+		else
+			true
+		fi
+		create
+		;;
+	remove)
+               if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+                else
+                        true
+                fi
+		remove
+		;;
+	help)
+		help
+		;;
+        reset)
+                reset
+                ;;
+	test)
+		test
+		;;
+
+	list)
+		list
+		;;
+	dump)
+		dump
+		;;
+	attach)
+		OOO=attach
+		at_manager
+		;;
+        detach)
+                OOO=detach
+                at_manager
+                ;;
+	block)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+                else
+                        true
+                fi
+
+		block_add
+		;;
+	unblock)
+                if [ "$VM" == "" ]
+                then
+                        printf "$ENTER_VM_NAME"
+                        return 1
+                else
+                        true
+                fi
+
+		block_delete
+		;;
+        shaper_add)
+                netlib_cmd_shaper_add
+                ;;
+        shaper_del)
+                netlib_cmd_shaper_add
+                ;;
+	edit)
+		nano $0
+		;;
+	* )
+		help
+		;;
+esac
+}
+
+main
+
